@@ -1,0 +1,11 @@
+# ESPHome secrets -- never commit real WiFi/API credentials
+secrets.yaml
+
+# ESPHome build artifacts, if anyone drops a full project in here
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# OS cruft
+.DS_Store
+Thumbs.db
