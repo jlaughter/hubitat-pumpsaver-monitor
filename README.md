@@ -97,6 +97,13 @@ controlled or configured by this integration, only observed.
   in capability-filtered device pickers (e.g. a Rule Machine "select a Power Meter"
   list) — Rule Machine's generic attribute picker still sees everything fine.
 
+## Throw a little glitter on it
+
+- **Enclosure!** I added STLs and a .3MF of an enclosure I designed for this - magnetic,
+  pops right on to the front of the Symcom box, and perfectly aligns the IR.  It holds
+  both a 30-pin ESP32 WROOM board, the OLED, and the IR phototransistor.  Needs to be
+  printed with supports due to the features on the back (magnets, phototransistor socket)
+
 ## License
 
 MIT.  All trademarks mentioned above are property of their respective owners and
