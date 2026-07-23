@@ -1,0 +1,532 @@
+# Complete example: ESP32 + bare IR phototransistor watching a
+# SymCom / Littelfuse PumpSaver Plus (tested on a 233P-1.5), plus a
+# 128x64 SSD1306 I2C OLED status display (yellow/blue variant).
+#
+# See README.md for hardware notes — in particular: you need a BARE
+# phototransistor/photodiode, NOT a TSOP-style 38 kHz IR receiver.
+#
+# Display wiring: I2C only (4 wires: VCC, GND, SDA, SCL). See the `i2c:`
+# block below for the two pins to change if your wiring differs from the
+# classic-ESP32 defaults (GPIO21/22).
+
+substitutions:
+  # --- Display threshold/timing tuning -- change these, not the lambdas ---
+
+  # IR signal health, in words/sec (PumpSaver Signal Rate diagnostic).
+  # A healthy, well-aimed sensor reads ~38-41 words/s per the README.
+  # Below this, header shows "IR WEAK". (Total silence for link_timeout
+  # seconds is separate: link_ok goes false -> header shows "IR DOWN"
+  # regardless of this threshold.)
+  ir_weak_threshold: "32"
+
+  # WiFi signal bars, in dBm. Standard "phone status bar" bands -- rarely
+  # needs tuning, broken out here in case your ESP32 sits somewhere marginal.
+  wifi_bar_4_rssi: "-50"   # 4 bars at or above this
+  wifi_bar_3_rssi: "-60"   # 3 bars at or above this
+  wifi_bar_2_rssi: "-70"   # 2 bars at or above this
+  wifi_bar_1_rssi: "-80"   # 1 bar at or above this; below this, 0 bars
+
+  # Normal page rotation speed (seconds per page, cycling through the 4
+  # regular pages: Live / Settings / Stats / Fault).
+  page_rotation_interval_s: "5"
+
+  # How long (seconds) the display holds on the Fault page after a NEW
+  # fault is detected (fault_sequence incrementing), before resuming normal
+  # rotation. This is what makes an active fault impossible to miss.
+  fault_override_hold_s: "120"
+
+esphome:
+  name: pumpsaver-monitor
+  friendly_name: PumpSaver Monitor
+  min_version: 2025.9.0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+        minimum_chip_revision: "3.1"
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+  port: 80
+  local: true
+  version: "2"
+
+external_components:
+  # Pre-release fault/link features: track main until their release tag exists.
+  - source: github://lizbit-official/esphome-pumpsaver@v0.5.0
+    components: [pumpsaver]
+
+# Field-proven receiver settings for the PumpSaver's baseband IR broadcast.
+# The phototransistor pulls the GPIO low on IR light -> inverted + pullup.
+remote_receiver:
+  id: ir_rx
+  pin:
+    number: GPIO27
+    inverted: true
+    mode:
+      input: true
+      pullup: false   # Use true for a bare phototransistor; use false and an external 1k pullup for crappy amazon components
+  filter: 5us         # real pulses are >= ~95 us; kill shorter glitches.  10us default; use 5us for crappy amazon components
+  idle: 40ms          # > the 11-16 ms inter-word gaps, < the ~146 ms
+                      # inter-transmission gap: one frame per transmission.
+                      # NOTE: on ESP32-C3/S3/C6 the RMT idle limit is 32767 us
+                      # at the default clock; either use idle: 30ms or add
+                      # clock_resolution: 500000.
+  buffer_size: 32kb
+  tolerance: 55%      # wide tolerance; decoding is done by the component.  45% default, 55% for crappy amazon components
+  receive_symbols: 2048
+
+pumpsaver:
+  receiver_id: ir_rx
+  link_timeout: 10s  # live/running entities become unavailable after IR silence
+
+button:
+  - platform: restart
+    name: "Restart"
+
+# ============================================================================
+# OLED display: I2C bus -- CHANGE THESE TWO PINS to match your wiring.
+# Classic ESP32 DevKit default I2C pins are GPIO21 (SDA) / GPIO22 (SCL);
+# other ESP32 variants (C3/S3/C6) vary -- check your board's pinout diagram
+# if you're not on a classic ESP32-WROOM-32.
+# ============================================================================
+i2c:
+  sda: GPIO21   # <-- change if your wiring differs
+  scl: GPIO22   # <-- change if your wiring differs
+  frequency: 400kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_main
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+
+globals:
+  - id: fault_override_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: page_rotation_index
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+script:
+  - id: clear_fault_override
+    then:
+      - delay: ${fault_override_hold_s}s
+      - globals.set:
+          id: fault_override_active
+          value: 'false'
+
+switch:
+  # Toggle the on-screen signal/link diagnostics page on demand -- normal
+  # rotation never includes this page; useful during install/troubleshooting
+  # without cluttering day-to-day viewing.
+  - platform: template
+    name: "Show Signal Diagnostics"
+    id: show_diagnostics
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # always starts off after a reboot
+
+  # Turn the physical OLED panel on/off (e.g. to blank it at night).
+  # Data continues to be collected/reported either way -- this only
+  # controls the display panel itself.
+  - platform: template
+    name: "Display Enabled"
+    id: display_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - lambda: |-
+          id(oled_display).turn_on();
+    on_turn_off:
+      - lambda: |-
+          id(oled_display).turn_off();
+
+interval:
+  - interval: ${page_rotation_interval_s}s
+    then:
+      - lambda: |-
+          if (id(fault_override_active)) {
+            id(oled_display).show_page(id(page_fault));
+            return;
+          }
+          if (id(show_diagnostics).state) {
+            id(oled_display).show_page(id(page_diag));
+            return;
+          }
+          id(page_rotation_index) = (id(page_rotation_index) + 1) % 4;
+          switch (id(page_rotation_index)) {
+            case 0: id(oled_display).show_page(id(page_live)); break;
+            case 1: id(oled_display).show_page(id(page_settings)); break;
+            case 2: id(oled_display).show_page(id(page_stats)); break;
+            case 3: id(oled_display).show_page(id(page_fault)); break;
+          }
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+    id: device_uptime
+    update_interval: 60s
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: device_wifi_signal
+    update_interval: 60s
+  - platform: pumpsaver
+    voltage:
+      name: "Pump Voltage"
+      id: voltage
+      filters:
+        - throttle: 15s
+    current:
+      name: "Pump Current"
+      id: current
+      filters:
+        - throttle: 15s
+    power:
+      name: "Pump Power"
+      id: power
+      filters:
+        - throttle: 15s
+    drywell_trip:
+      name: "Pump Dry-Well Trip Point"
+      id: drywell_trip
+    restart_delay_set:
+      name: "Pump Restart Delay Setting"
+      id: restart_delay_set
+    restart_remaining:
+      name: "Pump Restart Countdown"
+      id: restart_remaining
+    pump_starts:
+      name: "Pump Starts"
+      id: pump_starts
+    run_minutes:
+      name: "Pump Run Time"
+      id: run_minutes
+
+  # Advanced: expose any raw register (see the protocol repo's register map).
+  # Values are the raw 16-bit integers; apply scaling with ESPHome filters.
+  - platform: pumpsaver
+    register: 0x02
+    name: "Calibration Voltage"
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  # Fault history (ring decoded in protocol spec v0.2). fault_sequence is the
+  # automation trigger: details are published first, then this boot-local value
+  # increments after two matching complete generations. Initial acquisition is
+  # a quiet baseline (roughly 2-3 cycles); rapid unqualified changes can coalesce.
+  - platform: pumpsaver
+    last_fault_at:
+      name: "Pump Last Fault At"
+      id: last_fault_at
+    fault_sequence:
+      name: "Pump Fault Sequence"
+      id: fault_sequence
+      # Forces the display straight to the Fault page the instant a NEW
+      # fault is detected, and holds it there for fault_override_hold_s
+      # seconds before resuming normal page rotation.
+      on_value:
+        then:
+          - globals.set:
+              id: fault_override_active
+              value: 'true'
+          - script.execute: clear_fault_override
+
+  # Diagnostics (land in the HA device page's Diagnostics section).
+  # A healthy, well-aimed sensor reads ~40 words/s; see README troubleshooting.
+  - platform: pumpsaver
+    signal_rate:
+      name: "PumpSaver Signal Rate"
+      id: signal_rate
+      filters:
+        - throttle: 30s
+    decode_errors:
+      name: "PumpSaver Decode Errors"
+      id: decode_errors
+      filters:
+        - throttle: 30s
+    last_seen:
+      name: "PumpSaver Last Seen Age"
+      id: last_seen
+      filters:
+        - throttle: 30s
+
+text_sensor:
+  - platform: pumpsaver
+    last_fault:
+      name: "Pump Last Fault"
+      id: last_fault
+
+binary_sensor:
+  - platform: pumpsaver
+    name: "Pump Running"
+    id: pump_running
+    threshold: 200  # watts; idle self-draw is ~26 W, running ~820 W
+
+  - platform: pumpsaver
+    link_ok:
+      name: "PumpSaver Link"
+      id: link_ok
+
+display:
+  - platform: ssd1306_i2c
+    id: oled_display
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 1s
+    pages:
+      - id: page_live
+        lambda: |-
+          // ---- Header (shared across all pages) ----
+          std::string status_text;
+          if (id(restart_remaining).state > 0) {
+            status_text = "Fault";
+          } else if (id(pump_running).state) {
+            status_text = "RUN";
+          } else {
+            status_text = "IDLE";
+          }
+          it.print(2, 2, id(font_small), status_text.c_str());
+
+          std::string ir_text;
+          if (!id(link_ok).state) {
+            ir_text = "IR DOWN";
+          } else if (id(signal_rate).state < ${ir_weak_threshold}) {
+            ir_text = "IR WEAK";
+          } else {
+            ir_text = "IR OK";
+          }
+          it.print(58, 2, id(font_small), ir_text.c_str());
+
+          float rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4
+                   : (rssi >= ${wifi_bar_3_rssi}) ? 3
+                   : (rssi >= ${wifi_bar_2_rssi}) ? 2
+                   : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          int heights[4] = {4, 7, 10, 13};
+          for (int i = 0; i < 4; i++) {
+            int x = 110 + i * 4;
+            int h = heights[i];
+            int y = 15 - h;
+            if (i < bars) { it.filled_rectangle(x, y, 3, h); }
+            else { it.rectangle(x, y, 3, h); }
+          }
+          it.line(0, 16, 128, 16);
+
+          // ---- Body: live telemetry ----
+          // V+A share a line (smaller font -- "243.3V  10.61A" is too wide
+          // for font_main at 128px); W gets the big font as the headline
+          // number. Previous 3-line-all-font_main layout ran past the
+          // bottom of the 64px screen -- this fits comfortably instead.
+          // fmt() guards against NaN (no valid reading yet) showing as
+          // literal "nan" text -- prints "--" instead.
+          auto fmt = [](float v, int d) -> std::string {
+            if (std::isnan(v)) return "--";
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*f", d, v);
+            return std::string(buf);
+          };
+          it.printf(4, 18, id(font_main), "%sV %sA", fmt(id(voltage).state, 1).c_str(), fmt(id(current).state, 2).c_str());
+          it.printf(4, 40, id(font_main), "%s W", fmt(id(power).state, 0).c_str());
+
+      - id: page_settings
+        lambda: |-
+          std::string status_text;
+          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          else if (id(pump_running).state) { status_text = "RUN"; }
+          else { status_text = "IDLE"; }
+          it.print(2, 2, id(font_small), status_text.c_str());
+          std::string ir_text;
+          if (!id(link_ok).state) { ir_text = "IR DOWN"; }
+          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else { ir_text = "IR OK"; }
+          it.print(58, 2, id(font_small), ir_text.c_str());
+          float rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4
+                   : (rssi >= ${wifi_bar_3_rssi}) ? 3
+                   : (rssi >= ${wifi_bar_2_rssi}) ? 2
+                   : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          int heights[4] = {4, 7, 10, 13};
+          for (int i = 0; i < 4; i++) {
+            int x = 110 + i * 4; int h = heights[i]; int y = 15 - h;
+            if (i < bars) { it.filled_rectangle(x, y, 3, h); }
+            else { it.rectangle(x, y, 3, h); }
+          }
+          it.line(0, 16, 128, 16);
+
+          // ---- Body: protection settings ----
+          // Same overflow bug as the other pages -- font_main at y=48 ran
+          // past the 64px bottom edge; shifted up to y=40, which clears it.
+          // fmt() guards against NaN showing as literal "nan" text.
+          auto fmt = [](float v, int d) -> std::string {
+            if (std::isnan(v)) return "--";
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*f", d, v);
+            return std::string(buf);
+          };
+          it.printf(4, 18, id(font_small), "Trip: %s W", fmt(id(drywell_trip).state, 0).c_str());
+          it.printf(4, 30, id(font_small), "Delay set: %s min", fmt(id(restart_delay_set).state, 0).c_str());
+          // NaN > 0 is always false in IEEE754, so this already safely falls
+          // through to "No restart pending" on no-data rather than showing NaN.
+          if (id(restart_remaining).state > 0) {
+            it.printf(4, 42, id(font_main), "Rst: %.0fs", id(restart_remaining).state);
+          } else {
+            it.print(4, 44, id(font_small), "No restart pending");
+          }
+
+      - id: page_stats
+        lambda: |-
+          std::string status_text;
+          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          else if (id(pump_running).state) { status_text = "RUN"; }
+          else { status_text = "IDLE"; }
+          it.print(2, 2, id(font_small), status_text.c_str());
+          std::string ir_text;
+          if (!id(link_ok).state) { ir_text = "IR DOWN"; }
+          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else { ir_text = "IR OK"; }
+          it.print(58, 2, id(font_small), ir_text.c_str());
+          float rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4
+                   : (rssi >= ${wifi_bar_3_rssi}) ? 3
+                   : (rssi >= ${wifi_bar_2_rssi}) ? 2
+                   : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          int heights[4] = {4, 7, 10, 13};
+          for (int i = 0; i < 4; i++) {
+            int x = 110 + i * 4; int h = heights[i]; int y = 15 - h;
+            if (i < bars) { it.filled_rectangle(x, y, 3, h); }
+            else { it.rectangle(x, y, 3, h); }
+          }
+          it.line(0, 16, 128, 16);
+
+          // ---- Body: run stats ----
+          // fmt()/safe_int() guard against NaN (no valid reading yet):
+          // fmt() -> "--" text; safe_int() -> 0 rather than UB from casting
+          // NaN to int directly.
+          auto fmt = [](float v, int d) -> std::string {
+            if (std::isnan(v)) return "--";
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*f", d, v);
+            return std::string(buf);
+          };
+          auto safe_int = [](float v) -> int {
+            return std::isnan(v) ? 0 : (int) v;
+          };
+          it.printf(4, 20, id(font_small), "Starts: %s", fmt(id(pump_starts).state, 0).c_str());
+
+          int total_min = safe_int(id(run_minutes).state);
+          int r_d = total_min / 1440;
+          int r_h = (total_min % 1440) / 60;
+          int r_m = total_min % 60;
+          it.printf(4, 34, id(font_small), "Run: %dd %dh %dm", r_d, r_h, r_m);
+
+          int last_fault_at_min = safe_int(id(last_fault_at).state);
+          if (last_fault_at_min <= 0) {
+            it.print(4, 48, id(font_small), "No faults logged");
+          } else {
+            int since_min = total_min - last_fault_at_min;
+            if (since_min < 0) since_min = 0;
+            int s_d = since_min / 1440;
+            int s_h = (since_min % 1440) / 60;
+            it.printf(4, 48, id(font_small), "Last flt: %dd %dh ago", s_d, s_h);
+          }
+
+      - id: page_fault
+        lambda: |-
+          std::string status_text;
+          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          else if (id(pump_running).state) { status_text = "RUN"; }
+          else { status_text = "IDLE"; }
+          it.print(2, 2, id(font_small), status_text.c_str());
+          std::string ir_text;
+          if (!id(link_ok).state) { ir_text = "IR DOWN"; }
+          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else { ir_text = "IR OK"; }
+          it.print(58, 2, id(font_small), ir_text.c_str());
+          float rssi = id(device_wifi_signal).state;
+          int bars = (rssi >= ${wifi_bar_4_rssi}) ? 4
+                   : (rssi >= ${wifi_bar_3_rssi}) ? 3
+                   : (rssi >= ${wifi_bar_2_rssi}) ? 2
+                   : (rssi >= ${wifi_bar_1_rssi}) ? 1 : 0;
+          int heights[4] = {4, 7, 10, 13};
+          for (int i = 0; i < 4; i++) {
+            int x = 110 + i * 4; int h = heights[i]; int y = 15 - h;
+            if (i < bars) { it.filled_rectangle(x, y, 3, h); }
+            else { it.rectangle(x, y, 3, h); }
+          }
+          it.line(0, 16, 128, 16);
+
+          // ---- Body: last fault detail ----
+          // Fault number + time-since share one line (rather than a
+          // dedicated line just for "Fault #N") specifically to free up a
+          // full extra line for the wrapped message text below -- there
+          // genuinely isn't much room on a 64px display for this page.
+          auto fmt = [](float v, int d) -> std::string {
+            if (std::isnan(v)) return "--";
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*f", d, v);
+            return std::string(buf);
+          };
+          auto safe_int = [](float v) -> int {
+            return std::isnan(v) ? 0 : (int) v;
+          };
+          int total_min = safe_int(id(run_minutes).state);
+          int last_fault_at_min = safe_int(id(last_fault_at).state);
+          int since_min = total_min - last_fault_at_min;
+          if (since_min < 0) since_min = 0;
+          it.printf(4, 18, id(font_small), "#%s  %dd %dh ago",
+                    fmt(id(fault_sequence).state, 0).c_str(), since_min / 1440, (since_min % 1440) / 60);
+
+          // Rough, non-word-aware wrap. chars_per_line is a guess for
+          // font_small on a 128px-wide display -- tune it if text is
+          // clipping on the right edge or leaving too much unused space.
+          // Previous y-positions (34/46/58) ran past the 64px bottom edge
+          // on the 3rd line -- that's what was garbling/clipping in testing.
+          std::string fault_text = id(last_fault).state;
+          size_t len = fault_text.length();
+          const size_t chars_per_line = 20;
+          it.print(2, 30, id(font_small), fault_text.substr(0, std::min(len, chars_per_line)).c_str());
+          if (len > chars_per_line) {
+            it.print(2, 41, id(font_small), fault_text.substr(chars_per_line, std::min(len - chars_per_line, chars_per_line)).c_str());
+          }
+          if (len > chars_per_line * 2) {
+            it.print(2, 52, id(font_small), fault_text.substr(chars_per_line * 2, std::min(len - chars_per_line * 2, chars_per_line)).c_str());
+          }
+
+      - id: page_diag
+        lambda: |-
+          // Tightened padding vs. the other pages' header (this page has no
+          // RUN/IR/WiFi-bar row, just a title + rule, so it can afford to
+          // run leaner) -- reclaims ~8px, which is what the WiFi line was
+          // getting clipped by before.
+          it.print(2, 0, id(font_small), "DIAGNOSTICS");
+          it.line(0, 12, 128, 12);
+          auto fmt = [](float v, int d) -> std::string {
+            if (std::isnan(v)) return "--";
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.*f", d, v);
+            return std::string(buf);
+          };
+          it.printf(4, 16, id(font_small), "Signal: %s w/s", fmt(id(signal_rate).state, 1).c_str());
+          it.printf(4, 27, id(font_small), "Errors: %s /min", fmt(id(decode_errors).state, 1).c_str());
+          it.printf(4, 38, id(font_small), "Last seen: %s s", fmt(id(last_seen).state, 0).c_str());
+          it.printf(4, 49, id(font_small), "WiFi: %s dBm  Up: %sm",
+                    fmt(id(device_wifi_signal).state, 0).c_str(), fmt(id(device_uptime).state / 60.0f, 0).c_str());

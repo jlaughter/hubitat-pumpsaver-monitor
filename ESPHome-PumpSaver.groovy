@@ -24,9 +24,6 @@
  *      - platform: uptime
  *        name: "Uptime"
  *        update_interval: 60s
- *      - platform: wifi_signal
- *        name: "WiFi Signal"
- *        update_interval: 60s
  *
  *  MIT License
  */
@@ -315,8 +312,14 @@ private void updateAttribute(final String attribute, final Object rawValue, fina
         BigDecimal rounded = new BigDecimal(value.toString()).setScale(decimals, BigDecimal.ROUND_HALF_UP)
         value = decimals == 0 ? rounded.intValue() : rounded
     }
+    // Only send an event when the value actually changed -- previously this
+    // sent on every single incoming message regardless of whether anything
+    // changed, which is what drove the excessive event rate. Matches the
+    // pattern Konnected's own driver uses (gates the sendEvent call itself,
+    // not just the log line).
+    if (device.currentValue(attribute) == value) { return }
     final String descriptionText = "${attribute} was set to ${value}${unit ?: ''}"
-    if (device.currentValue(attribute) != value && settings.txtEnable) {
+    if (settings.txtEnable) {
         log.info descriptionText
     }
     sendEvent(name: attribute, value: value, unit: unit, descriptionText: descriptionText)
