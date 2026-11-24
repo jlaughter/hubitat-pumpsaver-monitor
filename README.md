@@ -71,13 +71,21 @@ controlled or configured by this integration, only observed.
       update_interval: 300s
   ```
 
-- **Throttle what the device reports.** Unfiltered, the PumpSaver component
-  re-publishes its entities several times a minute, which can overload the hub's
-  ESPHome connection — the device stays up, but Hubitat repeatedly marks it
-  offline and reconnects. Both example YAMLs use an `or: [throttle, delta]`
-  filter on each numeric sensor, so steady-state traffic is a trickle while real
-  changes (pump start/stop, faults, voltage sags) still report immediately.
-  If you write your own YAML, do the same.
+- **Turn off Wi-Fi power saving** (`power_save_mode: none` under `wifi:`).
+  This is the important one. With the ESP32's default light power-save,
+  traffic *to* the device (Hubitat's keepalive pings and API requests) can be
+  delayed or dropped for seconds to minutes while traffic *from* it keeps
+  flowing. The device never reboots or loses Wi-Fi, but Hubitat sees pings go
+  unanswered, marks it offline, and reconnects, as often as every ~10 minutes.
+  Signal strength doesn't matter here: the reference unit did this at a strong
+  -48 dBm. The device is mains-powered, so the extra power draw is irrelevant.
+  Both example YAMLs already set this.
+
+- **Throttle what the device reports** (recommended). Unfiltered, the PumpSaver
+  component re-publishes its entities several times a minute. Both example YAMLs
+  use an `or: [throttle, delta]` filter on each numeric sensor, so steady-state
+  traffic to the hub is a trickle while real changes (pump start/stop, faults,
+  voltage sags) still report immediately.
 
 ## Installation
 

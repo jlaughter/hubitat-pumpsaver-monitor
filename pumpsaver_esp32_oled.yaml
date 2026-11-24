@@ -57,6 +57,11 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Mains-powered: keep the radio awake. With ESP32's default light
+  # power-save, inbound packets (Hubitat's pings and API requests, ARP)
+  # were delayed or lost for seconds-to-minutes while outbound kept
+  # working, so the hub kept marking the device offline.
+  power_save_mode: none
 
 web_server:
   port: 80
