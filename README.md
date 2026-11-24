@@ -103,6 +103,7 @@ controlled or configured by this integration, only observed.
   pops right on to the front of the Symcom box, and perfectly aligns the IR.  It holds
   both a 30-pin ESP32 WROOM board, the OLED, and the IR phototransistor.  Needs to be
   printed with supports due to the features on the back (magnets, phototransistor socket)
+- **Flipper App!** Check out the repo on the companion Flipper Zero app that reads the PumpSaver directly, using just a phototransistor inserted into GPIO:  https://github.com/jlaughter/flipper-pumpsaver-reader
 
 ## License
 
