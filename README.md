@@ -65,11 +65,19 @@ controlled or configured by this integration, only observed.
   sensor:
     - platform: uptime
       name: "Uptime"
-      update_interval: 60s
+      update_interval: 300s
     - platform: wifi_signal
       name: "WiFi Signal"
-      update_interval: 60s
+      update_interval: 300s
   ```
+
+- **Throttle what the device reports.** Unfiltered, the PumpSaver component
+  re-publishes its entities several times a minute, which can overload the hub's
+  ESPHome connection — the device stays up, but Hubitat repeatedly marks it
+  offline and reconnects. Both example YAMLs use an `or: [throttle, delta]`
+  filter on each numeric sensor, so steady-state traffic is a trickle while real
+  changes (pump start/stop, faults, voltage sags) still report immediately.
+  If you write your own YAML, do the same.
 
 ## Installation
 
