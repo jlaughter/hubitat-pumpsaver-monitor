@@ -57,6 +57,11 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Mains-powered: keep the radio awake. With ESP32's default light
+  # power-save, inbound packets (Hubitat's pings and API requests, ARP)
+  # were delayed or lost for seconds-to-minutes while outbound kept
+  # working, so the hub kept marking the device offline.
+  power_save_mode: none
 
 web_server:
   port: 80
@@ -178,40 +183,62 @@ interval:
             case 3: id(oled_display).show_page(id(page_fault)); break;
           }
 
+# ---------------------------------------------------------------------------
+# Reporting cadence: the API/hub only sees FILTERED values. Pattern used below:
+#   or: [throttle (slow heartbeat), delta (report real changes immediately)]
+# so steady-state chatter is minimal but pump start/stop, faults and sags
+# still go out right away. The OLED reads .get_raw_state() for the fast-moving
+# values, so the local display stays live regardless of these filters.
+# ---------------------------------------------------------------------------
 sensor:
   - platform: uptime
     name: "Uptime"
     id: device_uptime
-    update_interval: 60s
+    update_interval: 300s
   - platform: wifi_signal
     name: "WiFi Signal"
     id: device_wifi_signal
-    update_interval: 60s
+    update_interval: 300s
   - platform: pumpsaver
     voltage:
       name: "Pump Voltage"
       id: voltage
       filters:
-        - throttle: 15s
+        - or:
+            - throttle: 300s
+            - delta: 5.0        # V -- real sags/swells, not 235.3<->235.8 noise
     current:
       name: "Pump Current"
       id: current
       filters:
-        - throttle: 15s
+        - or:
+            - throttle: 300s
+            - delta: 1.0        # A -- idle ~0.2 A, running is many amps
     power:
       name: "Pump Power"
       id: power
       filters:
-        - throttle: 15s
+        - or:
+            - throttle: 300s
+            - delta: 100.0      # W -- idle ~37 W, running ~820 W
     drywell_trip:
       name: "Pump Dry-Well Trip Point"
       id: drywell_trip
+      filters:
+        - or:
+            - throttle: 3600s
+            - delta: 15.0       # kills the 787<->791 flapping
     restart_delay_set:
       name: "Pump Restart Delay Setting"
       id: restart_delay_set
     restart_remaining:
       name: "Pump Restart Countdown"
       id: restart_remaining
+      filters:
+        - or:
+            - throttle: 60s     # countdown ticks every second during a fault
+            - delta: 300.0      # a new countdown starting (jump up) passes at once
+            - lambda: 'if (x == 0) return x; return {};'   # reaching 0 always passes
     pump_starts:
       name: "Pump Starts"
       id: pump_starts
@@ -257,17 +284,21 @@ sensor:
       name: "PumpSaver Signal Rate"
       id: signal_rate
       filters:
-        - throttle: 30s
+        - or:
+            - throttle: 600s
+            - delta: 8.0        # healthy ~41; a drop toward the 32 "weak" line passes
     decode_errors:
       name: "PumpSaver Decode Errors"
       id: decode_errors
       filters:
-        - throttle: 30s
+        - or:
+            - throttle: 600s
+            - delta: 2.0
     last_seen:
       name: "PumpSaver Last Seen Age"
       id: last_seen
       filters:
-        - throttle: 30s
+        - throttle: 600s        # ages every second; "PumpSaver Link" covers IR loss
 
 text_sensor:
   - platform: pumpsaver
@@ -297,7 +328,7 @@ display:
         lambda: |-
           // ---- Header (shared across all pages) ----
           std::string status_text;
-          if (id(restart_remaining).state > 0) {
+          if (id(restart_remaining).get_raw_state() > 0) {
             status_text = "Fault";
           } else if (id(pump_running).state) {
             status_text = "RUN";
@@ -309,7 +340,7 @@ display:
           std::string ir_text;
           if (!id(link_ok).state) {
             ir_text = "IR DOWN";
-          } else if (id(signal_rate).state < ${ir_weak_threshold}) {
+          } else if (id(signal_rate).get_raw_state() < ${ir_weak_threshold}) {
             ir_text = "IR WEAK";
           } else {
             ir_text = "IR OK";
@@ -344,19 +375,19 @@ display:
             snprintf(buf, sizeof(buf), "%.*f", d, v);
             return std::string(buf);
           };
-          it.printf(4, 18, id(font_main), "%sV %sA", fmt(id(voltage).state, 1).c_str(), fmt(id(current).state, 2).c_str());
-          it.printf(4, 40, id(font_main), "%s W", fmt(id(power).state, 0).c_str());
+          it.printf(4, 18, id(font_main), "%sV %sA", fmt(id(voltage).get_raw_state(), 1).c_str(), fmt(id(current).get_raw_state(), 2).c_str());
+          it.printf(4, 40, id(font_main), "%s W", fmt(id(power).get_raw_state(), 0).c_str());
 
       - id: page_settings
         lambda: |-
           std::string status_text;
-          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          if (id(restart_remaining).get_raw_state() > 0) { status_text = "Fault"; }
           else if (id(pump_running).state) { status_text = "RUN"; }
           else { status_text = "IDLE"; }
           it.print(2, 2, id(font_small), status_text.c_str());
           std::string ir_text;
           if (!id(link_ok).state) { ir_text = "IR DOWN"; }
-          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else if (id(signal_rate).get_raw_state() < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
           else { ir_text = "IR OK"; }
           it.print(58, 2, id(font_small), ir_text.c_str());
           float rssi = id(device_wifi_signal).state;
@@ -382,12 +413,12 @@ display:
             snprintf(buf, sizeof(buf), "%.*f", d, v);
             return std::string(buf);
           };
-          it.printf(4, 18, id(font_small), "Trip: %s W", fmt(id(drywell_trip).state, 0).c_str());
+          it.printf(4, 18, id(font_small), "Trip: %s W", fmt(id(drywell_trip).get_raw_state(), 0).c_str());
           it.printf(4, 30, id(font_small), "Delay set: %s min", fmt(id(restart_delay_set).state, 0).c_str());
           // NaN > 0 is always false in IEEE754, so this already safely falls
           // through to "No restart pending" on no-data rather than showing NaN.
-          if (id(restart_remaining).state > 0) {
-            it.printf(4, 42, id(font_main), "Rst: %.0fs", id(restart_remaining).state);
+          if (id(restart_remaining).get_raw_state() > 0) {
+            it.printf(4, 42, id(font_main), "Rst: %.0fs", id(restart_remaining).get_raw_state());
           } else {
             it.print(4, 44, id(font_small), "No restart pending");
           }
@@ -395,13 +426,13 @@ display:
       - id: page_stats
         lambda: |-
           std::string status_text;
-          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          if (id(restart_remaining).get_raw_state() > 0) { status_text = "Fault"; }
           else if (id(pump_running).state) { status_text = "RUN"; }
           else { status_text = "IDLE"; }
           it.print(2, 2, id(font_small), status_text.c_str());
           std::string ir_text;
           if (!id(link_ok).state) { ir_text = "IR DOWN"; }
-          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else if (id(signal_rate).get_raw_state() < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
           else { ir_text = "IR OK"; }
           it.print(58, 2, id(font_small), ir_text.c_str());
           float rssi = id(device_wifi_signal).state;
@@ -452,13 +483,13 @@ display:
       - id: page_fault
         lambda: |-
           std::string status_text;
-          if (id(restart_remaining).state > 0) { status_text = "Fault"; }
+          if (id(restart_remaining).get_raw_state() > 0) { status_text = "Fault"; }
           else if (id(pump_running).state) { status_text = "RUN"; }
           else { status_text = "IDLE"; }
           it.print(2, 2, id(font_small), status_text.c_str());
           std::string ir_text;
           if (!id(link_ok).state) { ir_text = "IR DOWN"; }
-          else if (id(signal_rate).state < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
+          else if (id(signal_rate).get_raw_state() < ${ir_weak_threshold}) { ir_text = "IR WEAK"; }
           else { ir_text = "IR OK"; }
           it.print(58, 2, id(font_small), ir_text.c_str());
           float rssi = id(device_wifi_signal).state;
@@ -525,8 +556,8 @@ display:
             snprintf(buf, sizeof(buf), "%.*f", d, v);
             return std::string(buf);
           };
-          it.printf(4, 16, id(font_small), "Signal: %s w/s", fmt(id(signal_rate).state, 1).c_str());
-          it.printf(4, 27, id(font_small), "Errors: %s /min", fmt(id(decode_errors).state, 1).c_str());
-          it.printf(4, 38, id(font_small), "Last seen: %s s", fmt(id(last_seen).state, 0).c_str());
+          it.printf(4, 16, id(font_small), "Signal: %s w/s", fmt(id(signal_rate).get_raw_state(), 1).c_str());
+          it.printf(4, 27, id(font_small), "Errors: %s /min", fmt(id(decode_errors).get_raw_state(), 1).c_str());
+          it.printf(4, 38, id(font_small), "Last seen: %s s", fmt(id(last_seen).get_raw_state(), 0).c_str());
           it.printf(4, 49, id(font_small), "WiFi: %s dBm  Up: %sm",
                     fmt(id(device_wifi_signal).state, 0).c_str(), fmt(id(device_uptime).state / 60.0f, 0).c_str());
